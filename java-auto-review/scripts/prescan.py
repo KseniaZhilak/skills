@@ -3,8 +3,8 @@
 Предпроверка автотеста (Spock/Groovy, а также Java/JUnit) по чеклисту.
 
 Находит КАНДИДАТОВ в нарушения и точные номера строк.
-Сам отклоняет кандидатов по проверяемым правилам и печатает черновик ответа.
-Модели остаётся заменить заглушки <...> по подсказкам под черновиком.
+Сам отклоняет кандидатов по проверяемым правилам и печатает ГОТОВЫЙ ответ.
+Модели остаётся показать вывод без изменений.
 
 Использование:
     python prescan.py LoginSpec.groovy [OtherSpec.groovy ...] [--numbered]
@@ -275,15 +275,24 @@ def scan(src, is_java):
             dur = f" {int(ms.group(1)) / 1000:g} с"
         enc = enclosing(m.start())
         nln, ntext = next_code_line(ln, line_of(enc["end"]) if enc else len(lines))
-        hint = None
-        if is_java:
-            fx = "`new WebDriverWait(driver, Duration.ofSeconds(10)).until(d -> <УСЛОВИЕ>)`"
+        elem = None
+        if ntext:
+            t2 = re.sub(r"^(?:def\s+|var\s+)?\w+\s*=(?!=)\s*", "", ntext)
+            em = re.match(r"^(.*?)\s*\.\s*(?:click|sendKeys|clear|submit|getText|text|value|getAttribute|isDisplayed|displayed|shouldBe|shouldHave)\b", t2)
+            if em and ("findElement" in em.group(1) or "$" in em.group(1) or "." in em.group(1)):
+                elem = em.group(1).strip()
+        if elem and elem.startswith("$"):
+            fx = f"`{elem}.shouldBe(visible, Duration.ofSeconds(10))`"
+        elif elem and is_java:
+            fx = f"`new WebDriverWait(driver, Duration.ofSeconds(10)).until(d -> {elem}.isDisplayed())`"
+        elif elem:
+            fx = f"`new PollingConditions(timeout: 10).eventually {{ assert {elem}.displayed }}`"
+        elif is_java:
+            fx = f"заменить на `WebDriverWait` с условием, которого ждёт строка {nln or ln + 1}"
         else:
-            fx = "`new PollingConditions(timeout: 10).eventually { assert <УСЛОВИЕ> }`"
-        if not reject:
-            hint = (f"<УСЛОВИЕ> — что должно стать готово перед строкой {nln}: `{ntext}`"
-                    if nln else "<УСЛОВИЕ> — чего ждёт тест после паузы")
-        add("SLEEP", m.start(), f"Пауза{dur} вместо ожидания условия", fx, hint=hint, reject=reject)
+            fx = f"заменить на `new PollingConditions(timeout: 10).eventually {{ assert ... }}` с условием, которого ждёт строка {nln or ln + 1}"
+        hint = None
+        add("SLEEP", m.start(), f"Пауза{dur} вместо ожидания условия", fx, reject=reject)
 
     # ---------- HARDCODE_URL ----------
     for m in STRING_RE.finditer(no_c):
@@ -438,11 +447,25 @@ def scan(src, is_java):
                         else:
                             problem = f"{name} меняется в {title(wmt)} и сохраняется между тестами"
                         kw = "@Shared" if shared else "static"
+                        wline = code(wln).rstrip(";")
+                        rm = re.search(r"(?<![\w.])" + name + r"\s*=(?!=)\s*(.+)$", wline)
+                        rhs = rm.group(1).split(";")[0].strip() if rm else None
+                        while rhs and rhs.endswith("}") and rhs.count("}") > rhs.count("{"):
+                            rhs = rhs[:-1].strip()
+                        local_names = set(re.findall(r"\bdef\s+(\w+)", wmt["body"])) | set(
+                            re.findall(r"\b[A-Z]\w*(?:<[^>]*>)?\s+(\w+)\s*=", wmt["body"]))
+                        used = set(re.findall(r"(?<![\w.'\"])([a-z_]\w*)", rhs or ""))
+                        base_name = re.sub(r"(?:Id|ID|Ids|List|s)$", "", name) or name
+                        helper = "create" + base_name[0].upper() + base_name[1:] + "()"
+                        note = ""
+                        if not rhs or used & local_names or "|" in rhs:
+                            rhs = helper
+                            note = f", код для {helper} взять из {title(wmt)}"
                         if is_java:
-                            fx = f"`@BeforeEach void setUp() {{ {name} = <СОЗДАТЬ ДАННЫЕ>; }}` (поле без {kw})"
+                            fx = f"`@BeforeEach void setUp() {{ {name} = {rhs}; }}` (поле без {kw}{note})"
                         else:
-                            fx = f"`def setup() {{ {name} = <СОЗДАТЬ ДАННЫЕ> }}` (поле без {kw})"
-                        hint = f"<СОЗДАТЬ ДАННЫЕ> — как получить {name}. Сейчас в {title(wmt)}, строка {wln}: `{code(wln)}`"
+                            fx = f"`def setup() {{ {name} = {rhs} }}` (поле без {kw}{note})"
+                        hint = None
                         add("TEST_DEPENDENCY", starts[ln - 1] + len(text) - len(text.lstrip()), problem, fx, hint=hint)
         if t:
             prev = t
@@ -455,19 +478,22 @@ def scan(src, is_java):
                 continue
             lln, ltext = last_code_line(mt)
             add("NO_ASSERT", mt["idx"], f"Тест {title(mt)} ничего не проверяет",
-                "добавить `assertThat(<ПРОВЕРКА>)`",
-                hint=f"<ПРОВЕРКА> — результат последнего действия, строка {lln}: `{ltext}`")
+                f"добавить `assertThat(...)` для результата строки {lln}: `{ltext}`")
             continue
         if "then" not in mt["labels"] and "expect" not in mt["labels"]:
             lln, ltext = last_code_line(mt)
-            am = ASSIGN_LINE_RE.match(ltext or "")
-            if am:
-                fx = "добавить `then: <ПРОВЕРКА>`"
-                hint = f"<ПРОВЕРКА> — условие на переменную {am.group(1)} (строка {lln}: `{ltext}`)"
+            ltext = (ltext or "").rstrip(";")
+            am = ASSIGN_LINE_RE.match(ltext)
+            http = re.search(r"\.(?:get|post|put|patch|delete|request)\s*\(", ltext)
+            if am and http:
+                fx = f"добавить `then: {am.group(1)}.status in [200, 201, 204]`"
+            elif am:
+                fx = f"добавить `then:` с проверкой `{am.group(1)}` (строка {lln})"
+            elif http:
+                fx = f"в when: `def result = {ltext}`, добавить `then: result.status in [200, 201, 204]`"
             else:
-                fx = f"в when: `def result = {ltext}`, добавить `then: <ПРОВЕРКА>`"
-                hint = f"<ПРОВЕРКА> — условие на result, результат строки {lln}: `{ltext}`"
-            add("NO_ASSERT", mt["idx"], "Тест ничего не проверяет: нет блока then:/expect:", fx, hint=hint)
+                fx = f"добавить `then:` с проверкой результата строки {lln}: `{ltext}`"
+            add("NO_ASSERT", mt["idx"], "Тест ничего не проверяет: нет блока then:/expect:", fx)
             continue
         body, base = mt["body"], mt["start"] + 1
         marks = [(x.group(1), x.start(), x.end()) for x in LABEL_RE.finditer(body)]
@@ -535,7 +561,6 @@ def report(path, numbered, multi):
     ok = [c for c in cands if not c["reject"]]
     rejected = [c for c in cands if c["reject"]]
 
-    print("=== ЧЕРНОВИК ОТВЕТА ===")
     if multi:
         print(f"**{path.split('/')[-1]}**")
         print()
@@ -544,14 +569,12 @@ def report(path, numbered, multi):
     else:
         print("| № | Пункт | Строка | Проблема | Исправление |")
         print("|---|-------|--------|----------|-------------|")
-        blocks, hints = [], []
+        blocks = []
         for n, c in enumerate(ok, 1):
             fix = c["fix"]
             if c["code"] and ("|" in c["code"] or len(c["code"]) > 110):
                 fix = f"см. ниже №{n}"
                 blocks.append((n, c["code"]))
-            if c["hint"]:
-                hints.append(f"№{n}: {c['hint']}")
             print(f"| {n} | {c['rule']} | {c['line']} | {cell(c['problem'])} | {fix} |")
         if blocks:
             print()
@@ -567,15 +590,6 @@ def report(path, numbered, multi):
             print("Отклонено: " + "; ".join(f"стр. {c['line']} — {c['reject']}" for c in rejected) + ".")
         else:
             print("Отклонено: нет.")
-    print("=== КОНЕЦ ЧЕРНОВИКА ===")
-    print()
-    hints = [f"№{n}: {c['hint']}" for n, c in enumerate(ok, 1) if c["hint"]]
-    if hints:
-        print("ЗАПОЛНИ ЗАГЛУШКИ:")
-        for h in hints:
-            print("- " + h)
-    else:
-        print("Заглушек нет: выведи черновик как есть.")
     if numbered:
         print()
         print("Код с номерами строк:")

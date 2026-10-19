@@ -1,0 +1,162 @@
+---
+name: java-autotest-review
+description: Ревью Java-автотестов (JUnit 4/5, TestNG, Selenium, Selenide, RestAssured) по фиксированному чеклисту из 7 пунктов — Thread.sleep, тест без проверки, хардкод URL, хардкод логинов/паролей/токенов, зависимость тестов друг от друга, static WebDriver, проглоченные исключения. Результат — таблица «пункт, строка, проблема, исправление». Используй, когда пользователь просит проверить, отревьюить, найти ошибки или плохие практики в автотесте или тестовом классе на Java, даже если он не говорит слово «ревью».
+---
+
+# Ревью Java-автотеста по чеклисту
+
+Проверяй код ТОЛЬКО по 7 пунктам ниже. Не оценивай стиль, названия, архитектуру и всё остальное, даже если видишь проблему. Пользователю нужна короткая предсказуемая таблица, а не общий отзыв.
+
+## Шаги
+
+1. Запусти предпроверку для каждого файла:
+   `python scripts/prescan.py <путь>/<Имя>Test.java`
+   Скрипт выдаст таблицу кандидатов C1, C2, … с номерами строк.
+   Номера строк бери ТОЛЬКО из вывода скрипта. Сам строки не считай.
+   Если запустить скрипт нельзя, пройди по чеклисту вручную, а в колонке «Строка» пиши имя метода вместо номера, например `login()`.
+2. Для каждого кандидата реши: ПОДТВЕРДИТЬ или ОТКЛОНИТЬ. Правила отклонения написаны у каждого пункта в разделе «Чеклист». Если правило отклонения не подходит, подтверди.
+3. Сделай одну ручную проверку, которую скрипт не умеет (пункт 5, «Ручная проверка»).
+4. Выведи ответ строго по шаблону из раздела «Формат ответа».
+
+## Чеклист
+
+### 1. SLEEP — жёсткая пауза
+Что ищем: `Thread.sleep(...)`, `TimeUnit.SECONDS.sleep(...)`, `sleep(...)` из Selenide.
+Почему плохо: тест либо ждёт зря, либо падает, если система отвечает дольше.
+Отклонить, если: sleep стоит внутри цикла, который на каждой итерации проверяет условие (самописное ожидание с опросом).
+Исправление: ждать условие. Условие возьми из строки ПОСЛЕ sleep — то, что тест делает дальше.
+- Selenium: `new WebDriverWait(driver, Duration.ofSeconds(10)).until(ExpectedConditions.visibilityOfElementLocated(By.id("profile")));`
+- Selenide: `$("#profile").shouldBe(visible, Duration.ofSeconds(10));`
+- API или БД: `await().atMost(10, SECONDS).until(() -> orderIsReady());`
+
+### 2. NO_ASSERT — тест без проверки
+Что ищем: метод `@Test` / `@ParameterizedTest` / `@RepeatedTest` без assert, should, verify, then, statusCode, body.
+Почему плохо: такой тест зелёный, даже если функция сломана.
+Отклонить, если: в теле вызывается метод, имя которого начинается с `check`, `verify`, `assert`, `should`, `validate`, `expect` — проверка внутри него.
+Строка: строка с именем метода.
+Исправление: добавь проверку результата последнего действия.
+- `assertThat(actual).isEqualTo(expected);`
+- `$("#profile").shouldHave(text("Иван"));`
+- `.then().statusCode(200);`
+
+### 3. HARDCODE_URL — адрес прямо в коде
+Что ищем: строка с `http://`, `https://`, `localhost` или IP-адресом.
+Почему плохо: тест нельзя запустить на другом стенде без правки кода.
+Отклонить, если: это значение по умолчанию во втором аргументе `System.getProperty("...", "...")` или `getenv`; это не адрес стенда (ссылка на стандарт, XML-namespace).
+Исправление: вынеси адрес в конфиг.
+- `private static final String BASE_URL = System.getProperty("baseUrl");`
+- в тесте: `driver.get(BASE_URL + "/login");`
+
+### 4. HARDCODE_CREDS — логин, пароль или токен в коде
+Что ищем: `password = "..."`, `.basic("user", "pass")`, `"password", "..."`, `sendKeys("...")` в поле пароля, `"Bearer ..."`.
+Почему плохо: секреты попадают в git, а при смене пароля падают все тесты.
+Отклонить, если: это заведомо неверное значение для негативного теста (`wrong_password`, `invalid`, пустая строка), и имя теста говорит о негативной проверке.
+Исправление: читай из окружения.
+- `String password = System.getenv("TEST_USER_PASSWORD");`
+- `.basic(System.getenv("API_USER"), System.getenv("API_PASSWORD"))`
+
+### 5. TEST_DEPENDENCY — тесты зависят друг от друга
+Что ищет скрипт: `@TestMethodOrder`, `@Order`, `@FixMethodOrder`, `dependsOnMethods`, `priority =`, static-поля без `final`.
+Ручная проверка: найди поле класса, которому значение присваивается в одном `@Test`, а читается в другом `@Test`. Это зависимость.
+- Если это поле уже есть среди кандидатов, не добавляй новую строку. Допиши в «Проблема», какой тест от какого зависит.
+- Если поля нет среди кандидатов, добавь строку. Строка — где поле присваивается.
+Несколько кандидатов про порядок (`@TestMethodOrder`, `@Order(1)`, `@Order(2)`) — это ОДНА строка таблицы по первому кандидату. Остальные отклони как дубли.
+Отклонить, если: static-поле заполняется только в `@BeforeAll` / `@BeforeClass` и тесты его не меняют.
+Почему плохо: тест нельзя запустить отдельно, а при параллельном запуске падает случайно.
+Исправление: каждый тест готовит свои данные сам.
+- `@BeforeEach void setUp() { orderId = api.createOrder(); }`
+- или в начале теста: `int orderId = api.createOrder();`
+- убрать `@Order` / `dependsOnMethods`
+
+### 6. STATIC_DRIVER — статический WebDriver
+Что ищем: `static WebDriver driver` (и ChromeDriver, RemoteWebDriver и т.д.).
+Почему плохо: при параллельном запуске все потоки управляют одним браузером.
+Отклонить: нечего, `static ThreadLocal<WebDriver>` скрипт уже пропускает.
+Исправление: `private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();` или нестатическое поле, которое создаётся в `@BeforeEach`.
+
+### 7. SWALLOWED_EXCEPTION — проглоченное исключение
+Что ищем: `catch`, после которого тест не падает: пустой, только `printStackTrace()`, только лог.
+Почему плохо: ошибка скрыта, тест зелёный.
+Отклонить, если: catch стоит в `@AfterEach` / `@AfterAll` / `@AfterMethod` / `tearDown` — там лог при очистке допустим.
+Исправление: убери try/catch и добавь `throws Exception` к методу, или в catch: `throw new AssertionError("Не найден профиль пользователя", e);`
+
+## Формат ответа
+
+Выведи ТОЛЬКО это, без вступления и без выводов в конце:
+
+~~~
+| № | Пункт | Строка | Проблема | Исправление |
+|---|-------|--------|----------|-------------|
+| 1 | SLEEP | 15 | Пауза 3 с перед кликом по профилю | `$("#profile").shouldBe(visible, Duration.ofSeconds(10));` |
+
+Итого: 1 нарушение.
+Отклонено: C3 — негативный тест; C5 — дубль C1.
+~~~
+
+Правила:
+- Одна строка таблицы = одно нарушение. Порядок — по номеру строки.
+- «Пункт» — код из чеклиста: SLEEP, NO_ASSERT, HARDCODE_URL, HARDCODE_CREDS, TEST_DEPENDENCY, STATIC_DRIVER, SWALLOWED_EXCEPTION.
+- «Проблема» — одно короткое предложение, до 12 слов, про ЭТОТ код.
+- «Исправление» — конкретный Java-код в обратных кавычках, одной строкой.
+- В ячейках нельзя использовать символ `|`. Если код длиннее одной строки или содержит `|`, напиши в ячейке «см. ниже №N» и добавь код под таблицей в блоке `### Код исправлений`.
+- В строке «Отклонено» перечисли каждого отклонённого кандидата с причиной в 2–4 слова. Если отклонённых нет, напиши `Отклонено: нет.`
+- Если нарушений нет, выведи одну строку: `Нарушений по чеклисту не найдено.`
+- Не добавляй пункты не из чеклиста.
+
+## Пример
+
+Код (LoginTest.java):
+~~~java
+public class LoginTest {
+    private static WebDriver driver;
+    private static String userId;
+
+    @Test
+    void createUser() {
+        userId = api.createUser();
+    }
+
+    @Test
+    void login() throws Exception {
+        driver.get("https://stage.myapp.com/login");
+        driver.findElement(By.id("password")).sendKeys("Qwerty123");
+        driver.findElement(By.id("submit")).click();
+        Thread.sleep(3000);
+        try {
+            driver.findElement(By.id("profile-" + userId)).click();
+        } catch (NoSuchElementException e) {
+            e.printStackTrace();
+        }
+    }
+}
+~~~
+
+Вывод скрипта:
+~~~
+| ID | Правило | Строка | Примечание | Код |
+| C1 | STATIC_DRIVER | 2 |  | private static WebDriver driver; |
+| C2 | TEST_DEPENDENCY | 3 | static-поле без final | private static String userId; |
+| C3 | NO_ASSERT | 6 | метод createUser() | void createUser() { |
+| C4 | NO_ASSERT | 11 | метод login() | void login() throws Exception { |
+| C5 | HARDCODE_URL | 12 |  | driver.get("https://stage.myapp.com/login"); |
+| C6 | HARDCODE_CREDS | 13 |  | driver.findElement(By.id("password")).sendKeys("Qwerty123"); |
+| C7 | SLEEP | 15 |  | Thread.sleep(3000); |
+| C8 | SWALLOWED_EXCEPTION | 18 | нет throw/fail | } catch (NoSuchElementException e) { |
+~~~
+
+Правильный ответ:
+~~~
+| № | Пункт | Строка | Проблема | Исправление |
+|---|-------|--------|----------|-------------|
+| 1 | STATIC_DRIVER | 2 | Один браузер на все потоки при параллельном запуске | `private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();` |
+| 2 | TEST_DEPENDENCY | 3 | login() использует userId, который создаёт createUser() | `@BeforeEach void setUp() { userId = api.createUser(); }` |
+| 3 | NO_ASSERT | 6 | createUser() ничего не проверяет | `assertThat(userId).isNotBlank();` |
+| 4 | NO_ASSERT | 11 | login() не проверяет, что вход выполнен | `assertThat(driver.findElement(By.id("profile-" + userId)).isDisplayed()).isTrue();` |
+| 5 | HARDCODE_URL | 12 | Адрес стенда зашит в код | `driver.get(System.getProperty("baseUrl") + "/login");` |
+| 6 | HARDCODE_CREDS | 13 | Пароль зашит в код | `.sendKeys(System.getenv("TEST_USER_PASSWORD"));` |
+| 7 | SLEEP | 15 | Пауза 3 с вместо ожидания профиля | `new WebDriverWait(driver, Duration.ofSeconds(10)).until(ExpectedConditions.visibilityOfElementLocated(By.id("profile-" + userId)));` |
+| 8 | SWALLOWED_EXCEPTION | 18 | Ошибка печатается, тест остаётся зелёным | `throw new AssertionError("Профиль не найден", e);` |
+
+Итого: 8 нарушений.
+Отклонено: нет.
+~~~
